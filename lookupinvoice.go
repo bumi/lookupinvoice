@@ -1,7 +1,6 @@
-package makeinvoice
+package lookupinvoice
 
 import (
-	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -11,25 +10,18 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
 	lightning "github.com/fiatjaf/lightningd-gjson-rpc"
-	"github.com/lnpay/lnpay-go"
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 var TorProxyURL = "socks5://127.0.0.1:9050"
 
 type Params struct {
-	Backend         BackendParams
-	Msatoshi        int64
-	Description     string
-	DescriptionHash []byte
-
-	Label string // only used for c-lightning
+	Backend     BackendParams
+	paymentHash string
 }
 
 type SparkoParams struct {
@@ -72,7 +64,12 @@ type BackendParams interface {
 	isTor() bool
 }
 
-func MakeInvoice(params Params) (bolt11 string, err error) {
+type Invoice struct {
+	Settled bool
+	Status  string
+}
+
+func LookupInvoice(params Params) (invoice Invoice, err error) {
 	defer func(prevTransport http.RoundTripper) {
 		http.DefaultClient.Transport = prevTransport
 	}(http.DefaultClient.Transport)
@@ -99,13 +96,6 @@ func MakeInvoice(params Params) (bolt11 string, err error) {
 	// set a timeout
 	http.DefaultClient.Timeout = 15 * time.Second
 
-	// description hash?
-	var hexh, b64h string
-	if params.DescriptionHash != nil {
-		hexh = hex.EncodeToString(params.DescriptionHash)
-		b64h = base64.StdEncoding.EncodeToString(params.DescriptionHash)
-	}
-
 	switch backend := params.Backend.(type) {
 	case SparkoParams:
 		spark := &lightning.Client{
@@ -114,41 +104,21 @@ func MakeInvoice(params Params) (bolt11 string, err error) {
 			CallTimeout: time.Second * 3,
 		}
 
-		var method, desc string
-		if params.DescriptionHash == nil {
-			method = "invoice"
-			desc = params.Description
-		} else {
-			method = "invoicewithdescriptionhash"
-			desc = hexh
-		}
-
-		label := params.Label
-		if label == "" {
-			label = "makeinvoice/" + strconv.FormatInt(time.Now().Unix(), 16)
-		}
-
-		inv, err := spark.Call(method, params.Msatoshi, label, desc)
+		inv, err := spark.Call("listinvoices", nil, nil, params.paymentHash, nil)
 		if err != nil {
-			return "", fmt.Errorf(method+" call failed: %w", err)
+			return Invoice{}, fmt.Errorf("listinvoices call failed: %w", err)
 		}
-		return inv.Get("bolt11").String(), nil
+		return Invoice{
+			Settled: inv.Get("status").String() == "paid",
+		}, nil
 
 	case LNDParams:
-		body, _ := sjson.Set("{}", "value_msat", params.Msatoshi)
-
-		if params.DescriptionHash == nil {
-			body, _ = sjson.Set(body, "memo", params.Description)
-		} else {
-			body, _ = sjson.Set(body, "description_hash", b64h)
-		}
-
-		req, err := http.NewRequest("POST",
-			backend.Host+"/v1/invoices",
-			bytes.NewBufferString(body),
+		req, err := http.NewRequest("GET",
+			backend.Host+"/v1/invoice/"+params.paymentHash,
+			nil,
 		)
 		if err != nil {
-			return "", err
+			return Invoice{}, err
 		}
 
 		// macaroon must be hex, so if it is on base64 we adjust that
@@ -159,7 +129,7 @@ func MakeInvoice(params Params) (bolt11 string, err error) {
 		req.Header.Set("Grpc-Metadata-macaroon", backend.Macaroon)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			return "", err
+			return Invoice{}, err
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode >= 300 {
@@ -168,43 +138,33 @@ func MakeInvoice(params Params) (bolt11 string, err error) {
 			if len(text) > 300 {
 				text = text[:300]
 			}
-			return "", fmt.Errorf("call to lnd failed (%d): %s", resp.StatusCode, text)
+			return Invoice{}, fmt.Errorf("call to lnd failed (%d): %s", resp.StatusCode, text)
 		}
 
 		b, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			return "", err
+			return Invoice{}, err
 		}
 
-		return gjson.ParseBytes(b).Get("payment_request").String(), nil
+		parsedBody := gjson.ParseBytes(b)
+		return Invoice{
+			Settled: parsedBody.Get("settled").Bool(),
+		}, nil
 
 	case LNBitsParams:
-		body, _ := sjson.Set("{}", "amount", params.Msatoshi/1000)
-		body, _ = sjson.Set(body, "out", false)
-
-		if params.DescriptionHash == nil {
-			if params.Description == "" {
-				body, _ = sjson.Set(body, "memo", "created by makeinvoice")
-			} else {
-				body, _ = sjson.Set(body, "memo", params.Description)
-			}
-		} else {
-			body, _ = sjson.Set(body, "description_hash", hexh)
-		}
-
-		req, err := http.NewRequest("POST",
-			backend.Host+"/api/v1/payments",
-			bytes.NewBufferString(body),
+		req, err := http.NewRequest("GET",
+			backend.Host+"/api/v1/payments"+params.paymentHash,
+			nil,
 		)
 		if err != nil {
-			return "", err
+			return Invoice{}, err
 		}
 
 		req.Header.Set("X-Api-Key", backend.Key)
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			return "", err
+			return Invoice{}, err
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode >= 300 {
@@ -213,29 +173,18 @@ func MakeInvoice(params Params) (bolt11 string, err error) {
 			if len(text) > 300 {
 				text = text[:300]
 			}
-			return "", fmt.Errorf("call to lnbits failed (%d): %s", resp.StatusCode, text)
+			return Invoice{}, fmt.Errorf("call to lnbits failed (%d): %s", resp.StatusCode, text)
 		}
 
 		defer resp.Body.Close()
 		b, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			return "", err
+			return Invoice{}, err
 		}
 
-		return gjson.ParseBytes(b).Get("payment_request").String(), nil
-	case LNPayParams:
-		client := lnpay.NewClient(backend.PublicAccessKey)
-		wallet := client.Wallet(backend.WalletInvoiceKey)
-		lntx, err := wallet.Invoice(lnpay.InvoiceParams{
-			NumSatoshis:     params.Msatoshi / 1000,
-			DescriptionHash: hexh,
-		})
-		if err != nil {
-			return "", fmt.Errorf("error creating invoice on lnpay: %w", err)
-		}
-
-		return lntx.PaymentRequest, nil
+		return Invoice{
+			Settled: gjson.ParseBytes(b).Get("paid").Bool(),
+		}, nil
 	}
-
-	return "", errors.New("missing backend params")
+	return Invoice{}, errors.New("missing backend params")
 }

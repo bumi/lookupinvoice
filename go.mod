@@ -1,4 +1,4 @@
-module github.com/fiatjaf/makeinvoice
+module github.com/bumi/lookupinvoice
 
 go 1.16
 
