@@ -21,7 +21,7 @@ var TorProxyURL = "socks5://127.0.0.1:9050"
 
 type Params struct {
 	Backend     BackendParams
-	paymentHash string
+	PaymentHash string
 }
 
 type SparkoParams struct {
@@ -104,7 +104,7 @@ func LookupInvoice(params Params) (invoice Invoice, err error) {
 			CallTimeout: time.Second * 3,
 		}
 
-		inv, err := spark.Call("listinvoices", nil, nil, params.paymentHash, nil)
+		inv, err := spark.Call("listinvoices", nil, nil, params.PaymentHash, nil)
 		if err != nil {
 			return Invoice{}, fmt.Errorf("listinvoices call failed: %w", err)
 		}
@@ -114,7 +114,7 @@ func LookupInvoice(params Params) (invoice Invoice, err error) {
 
 	case LNDParams:
 		req, err := http.NewRequest("GET",
-			backend.Host+"/v1/invoice/"+params.paymentHash,
+			backend.Host+"/v1/invoice/"+params.PaymentHash,
 			nil,
 		)
 		if err != nil {
@@ -153,7 +153,7 @@ func LookupInvoice(params Params) (invoice Invoice, err error) {
 
 	case LNBitsParams:
 		req, err := http.NewRequest("GET",
-			backend.Host+"/api/v1/payments"+params.paymentHash,
+			backend.Host+"/api/v1/payments"+params.PaymentHash,
 			nil,
 		)
 		if err != nil {
